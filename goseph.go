@@ -14,6 +14,7 @@ var (
 	verbose       = false
 	goInstall     = false
 	escapeWindows = false
+	escapeChecked = false
 	stdLibs       map[string]struct{}
 )
 
@@ -26,6 +27,7 @@ const (
 	GitStatus_Uncommitted = 2
 	GitStatus_Detached    = 3
 	GitStatus_Unpushed    = 4
+	GitStatus_NoUpstream  = 5
 )
 
 type GitProject struct {
@@ -128,33 +130,45 @@ func gitIsClean(gitPath string) GitStatus {
 		return GitStatus_Detached
 	}
 
-	var unsynced []byte
-	var attemptEscape bool
-
 	//Some (but not all) versions of git on windows like the curly brackets escaped.
 	//Rather than attempting to decipher this from the version of git installed, I just retry the first time this
 	//runs with an escape, if that works, then we switch over for remaining invokations
-	if !escapeWindows {
-		var err error
-		_, unsynced, err = runCmd(gitPath, "git", "rev-list", `HEAD@{upstream}..HEAD`)
+	if !escapeChecked {
+		_, _, err = runCmd(gitPath, "git", "rev-parse", "@{0}")
 		if err != nil {
-			attemptEscape = true
-		}
-	}
-
-	if escapeWindows || attemptEscape {
-		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@'{'upstream'}'..HEAD`)
-
-		if attemptEscape {
-			escapeWindows = true
-			if verbose {
-				fmt.Println("  Enabled escaping { and }")
+			_, _, err = runCmd(gitPath, "git", "rev-parse", "@'{'0'}'")
+			if err != nil {
+				fmt.Printf(" %s Error %s\n", ussr, ussr)
+				fmt.Printf("Could not determine if git curly braces need to be escaped\n")
+				fmt.Printf("git rev-parse @{0} failed both with and without quotes in %s\n", gitPath)
+				os.Exit(1)
+			} else {
+				escapeWindows = true
 			}
 		}
+		escapeChecked = true
 	}
+
+	if escapeWindows {
+		_, _, err = runCmd("git", "rev-parse", "--abrev-ref", "--symbolic-full-name", "@'{'upstream'}'")
+	} else {
+		_, _, err = runCmd("git", "rev-parse", "--abrev-ref", "--symbolic-full-name", "@{upstream}")
+	}
+	if err != nil {
+		return GitStatus_NoUpstream
+	}
+
+	var unsynced []byte
+	if escapeWindows {
+		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@{upstream}..HEAD`)
+	} else {
+		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@'{'upstream'}'..HEAD`)
+	}
+
 	if len(unsynced) == 0 {
 		return GitStatus_Clean
 	}
+
 	return GitStatus_Unpushed
 }
 
@@ -167,6 +181,11 @@ func gitToMaster(gitPath string) {
 		os.Exit(1)
 	}
 	_ = mustRunCmd(gitPath, "git", "checkout", "master")
+}
+
+func gitSHA(workingDir string) string {
+	sha := mustRunCmd(workingDir, "git", "rev-parse", "HEAD")
+	return strings.Split(string(sha), "\n")[0]
 }
 
 // Populates .RemoteOriginUrl, .GitStatus, .SHA and .Branch (i.e. does not touch .GoImport)
@@ -183,8 +202,7 @@ func gitDetails(workingDir string) (result *GitProject) {
 		result.GitStatus = gitIsClean(workingDir)
 	}
 
-	shaOutput := mustRunCmd(workingDir, "git", "rev-parse", "HEAD")
-	result.SHA = strings.Split(string(shaOutput), "\n")[0]
+	result.SHA = gitSHA(workingDir)
 
 	branchOutput := mustRunCmd(workingDir, "git", "rev-parse", "--abbrev-ref", "HEAD")
 	result.Branch = strings.Split(string(branchOutput), "\n")[0]
@@ -314,11 +332,16 @@ func Snapshot(allDeps map[string]Dependency) ([]*GitProject, bool) {
 	for importName, dependency := range allDeps {
 		switch dependency := dependency.(type) {
 		case *GitProject:
-			gitDeps[dependency.GoImport] = dependency
+			if dependency != nil {
+				gitDeps[dependency.GoImport] = dependency
+			} else {
+				fmt.Printf("Import '%s' is neither a standard library nor part of a git project\n", importName)
+				canOutput = false
+			}
 		case *StandardLib:
 		case *SamePkg:
 		default:
-			fmt.Printf("Import '%s' is neither a standard library nor part of a git project (%T)\n", importName, dependency)
+			fmt.Printf("Import '%s' is neither a standard library nor part of a git project\n", importName)
 			canOutput = false
 		}
 	}
@@ -328,6 +351,9 @@ func Snapshot(allDeps map[string]Dependency) ([]*GitProject, bool) {
 			fmt.Printf("Snapshot '%s' failed. No remote URL.\n", dependency.GoImport)
 			canOutput = false
 		} else if dependency.Branch != "master" {
+			//TODO this is actually flawed. if the branch comes back as HEAD, this implies a detached HEAD state.
+			//if that's the case, we need to do a git ls-remote origin, which gives a list of all remote tracking tags
+			//from that we can infer if this SHA means anything. This is pretty slow though.
 			fmt.Printf("Snapshot '%s' failed. Branch is not master (%s).\n",
 				dependency.GoImport, dependency.Branch)
 			canOutput = false
@@ -341,6 +367,10 @@ func Snapshot(allDeps map[string]Dependency) ([]*GitProject, bool) {
 			canOutput = false
 		} else if dependency.GitStatus == GitStatus_Unpushed {
 			fmt.Printf("Snapshot '%s' failed. Unpushed git changes.\n",
+				dependency.GoImport)
+			canOutput = false
+		} else if dependency.GitStatus == GitStatus_NoUpstream {
+			fmt.Printf("Snopshot '%s' failed. No upstream.\n",
 				dependency.GoImport)
 			canOutput = false
 		} else {
@@ -418,15 +448,17 @@ func UpdateAll(gopath string, jsonDependencies []*GitProject, gitCacheFile strin
 			fmt.Printf("Skipping %s. git status is unclean.\n", dependency.GoImport)
 		} else {
 			_ = mustRunCmd(importPath, "git", "pull")
-			if goInstall {
-				_ = mustRunCmd(importPath, "go", "install", "./...")
-			}
 			updated = append(updated, dependency)
 		}
 	}
 
 	RecursiveUpdate(gopath, gitCacheFile, "update", updated, gitCache)
 
+	if goInstall {
+		//Only 'go install' dependencies managed by goseph (for now).
+		//and only run after dependencies have been pulled
+		_ = mustRunCmd(".", "go", "install", "./...")
+	}
 }
 
 func cloneDependency(importPath string, dependency *GitProject) {
@@ -437,9 +469,6 @@ func cloneDependency(importPath string, dependency *GitProject) {
 	}
 
 	_ = mustRunCmd(dir, "git", "clone", dependency.RemoteOriginUrl, file)
-	if goInstall {
-		_ = mustRunCmd(importPath, "go", "install", "./...")
-	}
 }
 
 func CloneMissing(gopath string, jsonDependencies []*GitProject, cacheFile string) {
@@ -454,7 +483,13 @@ func CloneMissing(gopath string, jsonDependencies []*GitProject, cacheFile strin
 		cloneDependency(importPath, dependency)
 		cloned = append(cloned, dependency)
 	}
+
 	RecursiveUpdate(gopath, cacheFile, "fetch", cloned, map[string]*GitProject{})
+
+	if goInstall {
+		//See comments in UpdateAll
+		_ = mustRunCmd(".", "go", "install", "./...")
+	}
 }
 
 func Reproduce(gopath string, jsonDependencies []*GitProject) {
@@ -471,7 +506,17 @@ func Reproduce(gopath string, jsonDependencies []*GitProject) {
 		}
 
 		_ = mustRunCmd(dir, "git", "clone", dependency.RemoteOriginUrl, file)
-		_ = mustRunCmd(importPath, "git", "checkout", dependency.SHA)
+
+		sha := gitSHA(importPath)
+		if sha != dependency.SHA {
+			fmt.Printf("WARNING repo %s is being rolled back to previous SHA, head will be disconnected.\n", importPath)
+			_ = mustRunCmd(importPath, "git", "checkout", dependency.SHA)
+		}
+	}
+
+	//There is no transitive dependencies when reproducing, as the snapshot captures the entire chain of what's required
+	//to build/test
+	for _, dependency := range jsonDependencies {
 		if goInstall {
 			_ = mustRunCmd(importPath, "go", "install", "./...")
 		}
