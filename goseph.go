@@ -134,7 +134,7 @@ func gitIsClean(gitPath string) GitStatus {
 	//Rather than attempting to decipher this from the version of git installed, I just retry the first time this
 	//runs with an escape, if that works, then we switch over for remaining invokations
 	if !escapeChecked {
-		_, _, err = runCmd(gitPath, "git", "rev-parse", "@{0}")
+		_, _, err := runCmd(gitPath, "git", "rev-parse", "@{0}")
 		if err != nil {
 			_, _, err = runCmd(gitPath, "git", "rev-parse", "@'{'0'}'")
 			if err != nil {
@@ -149,10 +149,11 @@ func gitIsClean(gitPath string) GitStatus {
 		escapeChecked = true
 	}
 
+	var err error
 	if escapeWindows {
-		_, _, err = runCmd("git", "rev-parse", "--abrev-ref", "--symbolic-full-name", "@'{'upstream'}'")
+		_, _, err = runCmd(gitPath, "git", "rev-parse", "--abrev-ref", "--symbolic-full-name", `@\{upstream\}`)
 	} else {
-		_, _, err = runCmd("git", "rev-parse", "--abrev-ref", "--symbolic-full-name", "@{upstream}")
+		_, _, err = runCmd(gitPath, "git", "rev-parse", "--abrev-ref", "--symbolic-full-name", "@{upstream}")
 	}
 	if err != nil {
 		return GitStatus_NoUpstream
@@ -160,9 +161,9 @@ func gitIsClean(gitPath string) GitStatus {
 
 	var unsynced []byte
 	if escapeWindows {
-		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@{upstream}..HEAD`)
+		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@\{upstream\}..HEAD`)
 	} else {
-		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@'{'upstream'}'..HEAD`)
+		unsynced = mustRunCmd(gitPath, "git", "rev-list", `HEAD@{upstream}..HEAD`)
 	}
 
 	if len(unsynced) == 0 {
@@ -370,7 +371,7 @@ func Snapshot(allDeps map[string]Dependency) ([]*GitProject, bool) {
 				dependency.GoImport)
 			canOutput = false
 		} else if dependency.GitStatus == GitStatus_NoUpstream {
-			fmt.Printf("Snopshot '%s' failed. No upstream.\n",
+			fmt.Printf("Snapshot '%s' failed. No upstream.\n",
 				dependency.GoImport)
 			canOutput = false
 		} else {
@@ -516,10 +517,8 @@ func Reproduce(gopath string, jsonDependencies []*GitProject) {
 
 	//There is no transitive dependencies when reproducing, as the snapshot captures the entire chain of what's required
 	//to build/test
-	for _, dependency := range jsonDependencies {
-		if goInstall {
-			_ = mustRunCmd(importPath, "go", "install", "./...")
-		}
+	if goInstall {
+		_ = mustRunCmd(".", "go", "install", "./...")
 	}
 }
 
